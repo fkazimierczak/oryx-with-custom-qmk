@@ -78,19 +78,69 @@ jobs:
           git merge -Xignore-all-space oryx
           git push
 
+      # Image layers are cached in the GitHub Actions cache; the image is
+      # rebuilt only when the Dockerfile changes. Built before the QMK
+      # checkout so the build context stays small.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build qmk docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: qmk
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve QMK firmware commit (${{ steps.download-layout-source.outputs.firmware_version }})
+        id: qmk-ref
+        run: |
+          branch="firmware${{ steps.download-layout-source.outputs.firmware_version }}"
+          url=$(git config -f .gitmodules submodule.qmk_firmware.url)
+          sha=$(git ls-remote "${url}" "refs/heads/${branch}" | cut -f1)
+          if [[ -z "${sha}" ]]; then
+            echo "Branch ${branch} not found in ${url}" >&2
+            exit 1
+          fi
+          echo branch=${branch} >> "$GITHUB_OUTPUT"
+          echo sha=${sha} >> "$GITHUB_OUTPUT"
+
+      # The checkout is keyed by the exact fork commit, so a hit is always
+      # current. Restore and save are split so the cache is saved right after
+      # cloning, before the build writes .build/ and firmware files into it.
+      - name: Restore QMK firmware checkout from cache
+        id: qmk-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            qmk_firmware
+            .git/modules/qmk_firmware
+          key: qmk-${{ steps.qmk-ref.outputs.branch }}-${{ steps.qmk-ref.outputs.sha }}
+
       - name: Update QMK firmware submodule to latest version (${{ steps.download-layout-source.outputs.firmware_version }})
         run: |
-          git submodule update --init --remote --depth=1 --no-single-branch
-          cd qmk_firmware
-          git checkout -B firmware${{ steps.download-layout-source.outputs.firmware_version }} origin/firmware${{ steps.download-layout-source.outputs.firmware_version }}
-          git submodule update --init --recursive
-          cd ..
+          if [[ "${{ steps.qmk-cache.outputs.cache-hit }}" == "true" ]]; then
+            git submodule init qmk_firmware
+          else
+            git submodule update --init --remote --depth=1 --no-single-branch
+            cd qmk_firmware
+            git checkout -B ${{ steps.qmk-ref.outputs.branch }} ${{ steps.qmk-ref.outputs.sha }}
+            git submodule update --init --recursive
+            cd ..
+          fi
           git add qmk_firmware
           git commit -m "✨(qmk): Update firmware" || echo "No QMK change"
           git push
 
-      - name: Build qmk docker image
-        run: docker build -t qmk .
+      - name: Save QMK firmware checkout to cache
+        if: steps.qmk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            qmk_firmware
+            .git/modules/qmk_firmware
+          key: qmk-${{ steps.qmk-ref.outputs.branch }}-${{ steps.qmk-ref.outputs.sha }}
 
       - name: Build the layout
         id: build-layout
